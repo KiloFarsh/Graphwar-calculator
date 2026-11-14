@@ -1,8 +1,3 @@
 # Graphwar-calculator
 
-<p align="center">
-  <a href="https://youtu.be/vFWLkFUQGcU">
-    <img src="https://img.youtube.com/vi/vFWLkFUQGcU/maxresdefault.jpg" alt="Graphwar-calculator Demo" width="100%">
-  </a>
-</p>
-<p align="center"><em>Нажмите на картинку, чтобы посмотреть демонстрацию работы бота!</em></p>
+<img width="1092" height="614" alt="Graphwar" src="https://github.com/user-attachments/assets/394f8c89-f1e9-43d6-af72-5201e4d01440" />
