@@ -2,10 +2,9 @@
 Бот для классического Graphwar (окно 800x600, режим обычной функции).
 
 В этом режиме игра сама сдвигает график по вертикали так, чтобы он прошёл
-через вашего солдата. Поэтому прямое попадание — это наклон
-k = (y_цели - y_солдата) / (x_цели - x_солдата), то есть формула k*x.
-Если на прямой чёрный круг, добавляется горб sin, который в точках
-солдата и цели равен нулю и не сбивает попадание.
+через вашего солдата. Бот строит интерполяционную формулу через несколько
+вражеских солдат и проверяет путь на круги и союзников. Если общей безопасной
+кривой нет, он выбирает выстрел с максимальным числом целей во взрыве.
 
 Оси на поле: x от -25 до 25. По вертикали тот же масштаб, что и по
 горизонтали (50 единиц на ширину поля), поэтому y примерно от -14.61 до 14.61,
@@ -342,6 +341,100 @@ def path_is_clear(xp, yp, xt, yt, amp, freq, blocked, width, height):
     return True
 
 
+def interpolate_relative(knots, x):
+    values = []
+    for index, (xi, yi) in enumerate(knots):
+        value = yi
+        for other_index in range(len(knots)):
+            if other_index != index:
+                xj = knots[other_index][0]
+                value *= (x - xj) / (xi - xj)
+        values.append(value)
+    return sum(values)
+
+
+def build_interpolated_formula(knots):
+    terms = []
+    for index, (xi, yi) in enumerate(knots):
+        if abs(yi) < 1e-9:
+            continue
+        factors = []
+        for other_index in range(len(knots)):
+            if other_index == index:
+                continue
+            xj = knots[other_index][0]
+            factors.append(f"((x-({num(xj)}))/({num(xi - xj)}))")
+        terms.append(f"({num(yi)})*({'*'.join(factors)})")
+    return "+".join(terms) or "0"
+
+
+def path_is_clear_curve(player, targets, knots, allies, blocked, width, height):
+    xp, yp = player
+    xt = targets[-1][0]
+    dx = xt - xp
+    if abs(dx) < 1e-6:
+        return False
+
+    scale = width / PLANE_W
+    limit = y_limit(width, height) - 0.35
+    steps = max(50, int(abs(dx) / 0.04))
+    start_px = math_to_px(xp, yp, width, height)
+    safe_start = (SOLDIER_RADIUS_PX + 6) * scale
+    safe_target = (EXPLOSION_RADIUS_PX + 4) * scale
+    target_pixels = [item[2] for item in targets]
+    ally_mask = np.zeros_like(blocked)
+    avoid_r = int(round((SOLDIER_RADIUS_PX + 8) * scale))
+    for ax, ay, _ in allies:
+        apx, apy = math_to_px(ax, ay, width, height)
+        cv2.circle(ally_mask, (int(round(apx)), int(round(apy))), avoid_r, 255, -1)
+
+    for index in range(steps + 1):
+        t = index / steps
+        x = xp + dx * t
+        y = yp + interpolate_relative(knots, x)
+        if not math.isfinite(y) or y > limit or y < -limit:
+            return False
+        px, py = math_to_px(x, y, width, height)
+        ix = int(round(px))
+        iy = int(round(py))
+        if ix < 1 or iy < 1 or ix >= width - 1 or iy >= height - 1:
+            return False
+        if math.hypot(px - start_px[0], py - start_px[1]) <= safe_start:
+            continue
+        if ally_mask[iy - 1:iy + 2, ix - 1:ix + 2].any():
+            return False
+        near_target = any(
+            math.hypot(px - target_px[0], py - target_px[1]) <= safe_target
+            for target_px in target_pixels
+        )
+        if not near_target and blocked[iy - 1:iy + 2, ix - 1:ix + 2].any():
+            return False
+    return True
+
+
+def plan_multi_curve(player, enemies, allies, blocked, width, height):
+    """Builds one interpolated formula through as many reachable enemies as possible."""
+    xp = player[0]
+    direction = 1 if enemies[0][0] >= xp else -1
+    ordered = sorted(enemies, key=lambda item: direction * (item[0] - xp))
+    selected = []
+    for enemy in ordered:
+        if abs(enemy[0] - xp) < 0.35:
+            continue
+        if any(abs(enemy[0] - other[0]) < 0.35 for other in selected):
+            continue
+        selected.append(enemy)
+
+    for count in range(len(selected), 1, -1):
+        targets = selected[:count]
+        knots = [(xp, 0.0)]
+        for enemy in targets:
+            knots.append((enemy[0], enemy[1] - player[1]))
+        if path_is_clear_curve(player, targets, knots, allies, blocked, width, height):
+            return build_interpolated_formula(knots), targets, knots
+    return None
+
+
 def build_formula(xp, xt, yt_minus_yp, dx, amp, freq):
     k = yt_minus_yp / dx
     if abs(amp) < 0.05:
@@ -393,7 +486,7 @@ def formula_point(xp, yp, xt, yt, amp, freq, x):
     return trajectory_y(xp, yp, xt, yt, amp, freq, x)
 
 
-def draw_debug(board, player_px, allies, enemies, chosen, amp, freq, plane_box):
+def draw_debug(board, player_px, allies, enemies, chosen, amp, freq, plane_box, trajectory=None):
     canvas = board.copy()
     overlay = canvas.copy()
     mask = obstacle_mask(board)
@@ -408,7 +501,7 @@ def draw_debug(board, player_px, allies, enemies, chosen, amp, freq, plane_box):
         pts = []
         for index in range(80):
             x = xp + dx * index / 79
-            y = formula_point(xp, yp, xt, yt, amp, freq, x)
+            y = trajectory(x) if trajectory is not None else formula_point(xp, yp, xt, yt, amp, freq, x)
             px, py = math_to_px(x, y, width, height)
             pts.append((int(round(px)), int(round(py))))
         cv2.polylines(canvas, [np.array(pts, np.int32)], False, (0, 220, 255), 2)
@@ -512,19 +605,32 @@ def _analyze(fire):
     for soldier in soldiers:
         cv2.circle(blocked, soldier, clear_r, 0, -1)
 
-    planned = plan_shot(player, enemies, allies, blocked, w, h)
-    if planned is None:
-        print("[Ошибка] До врагов не добраться: дуга упирается в круги или в край поля.")
-        draw_debug(board, player_px, allies, enemies, None, 0, 1, plane)
-        return
+    multi_plan = plan_multi_curve(player, enemies, allies, blocked, w, h)
+    if multi_plan is not None:
+        formula, targets, knots = multi_plan
+        target = (targets[-1][0], targets[-1][1])
+        trajectory = lambda x: player[1] + interpolate_relative(knots, x)
+        path = draw_debug(board, player_px, allies, enemies, target, 0, 1, plane, trajectory)
+        print(f"[Успех] Одна кривая проходит через {len(targets)} из {len(enemies)} противников.")
+        print("[Важно] Если игра останавливает снаряд при первом попадании, следующие цели не будут поражены.")
+        if len(targets) < len(enemies):
+            print("[Ограничение] Некоторые цели имеют слишком близкие координаты x для одной функции y=f(x).")
+    else:
+        print("[INFO] Общая кривая небезопасна; ищу выстрел с максимальным числом целей во взрыве.")
+        planned = plan_shot(player, enemies, allies, blocked, w, h)
+        if planned is None:
+            print("[Ошибка] До врагов не добраться: дуга упирается в круги или в край поля.")
+            draw_debug(board, player_px, allies, enemies, None, 0, 1, plane)
+            return
 
-    _score, formula, target, _pixel, amp, freq, killed = planned
-    path = draw_debug(board, player_px, allies, enemies, target, amp, freq, plane)
-    kind = "прямая" if abs(amp) < 0.05 else f"дуга {amp:+.2f}, частота {freq}"
-    print(f"[Успех] Солдат ({player[0]:.2f}, {player[1]:.2f}) -> цель ({target[0]:.2f}, {target[1]:.2f}), {kind}")
-    print(f"[Оценка] Один взрыв накроет примерно {killed} из {len(enemies)} противников.")
-    if killed < len(enemies):
-        print("[Ограничение] Противники вне радиуса этого взрыва; одна формула не гарантирует уничтожение всех.")
+        _score, formula, target, _pixel, amp, freq, killed = planned
+        path = draw_debug(board, player_px, allies, enemies, target, amp, freq, plane)
+        kind = "прямая" if abs(amp) < 0.05 else f"дуга {amp:+.2f}, частота {freq}"
+        print(f"[Успех] Солдат ({player[0]:.2f}, {player[1]:.2f}) -> цель ({target[0]:.2f}, {target[1]:.2f}), {kind}")
+        print(f"[Оценка] Один взрыв накроет примерно {killed} из {len(enemies)} противников.")
+        if killed < len(enemies):
+            print("[Ограничение] Противники вне радиуса этого взрыва; одна формула не гарантирует уничтожение всех.")
+
     print(f"[Формула] {formula}")
     print(f"[Картинка] {path}")
 
@@ -593,8 +699,28 @@ def self_test():
     clustered_plan = plan_shot((-15.0, 0.0), clustered, [], clear, width, height)
     assert clustered_plan is not None
     assert clustered_plan[6] == 2, clustered_plan[6]
+
+    multi_enemies = [
+        (10.0, 2.5, tuple(int(round(value)) for value in math_to_px(10.0, 2.5, width, height))),
+        (13.0, 2.8, tuple(int(round(value)) for value in math_to_px(13.0, 2.8, width, height))),
+        (16.0, 3.1, tuple(int(round(value)) for value in math_to_px(16.0, 3.1, width, height))),
+    ]
+    multi_plan = plan_multi_curve((-15.0, 0.0), multi_enemies, [], clear, width, height)
+    assert multi_plan is not None
+    formula, targets, knots = multi_plan
+    assert len(targets) == len(multi_enemies), len(targets)
+    for tx, ty, _ in targets:
+        assert abs(interpolate_relative(knots, tx) - ty) < 1e-6
+        assert abs(eval(formula, {"__builtins__": {}}, {"x": tx}) - ty) < 1e-4
+    assert "sin(" not in formula
+
+    ally_px = tuple(int(round(value)) for value in math_to_px(0.0, 1.5, width, height))
+    ally_on_path = [(0.0, 1.5, ally_px)]
+    assert plan_multi_curve((-15.0, 0.0), multi_enemies, ally_on_path, clear, width, height) is None
+
     print("[TEST] координаты, сдвиг формулы, оси и обход круга — ок")
     print("[TEST] выбор цели с максимальным числом противников во взрыве — ок")
+    print("[TEST] одна формула интерполирует несколько целей — ок")
     print("[TEST] солдаты для проверки:", p, t)
 
 
